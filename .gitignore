@@ -1,0 +1,12 @@
+# Local dev/build artifacts — never committed.
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+build/
+dist/
+
+# Maintainer's private PII-scan patterns (literal identities) — NEVER in the public repo.
+scripts/.pii-local

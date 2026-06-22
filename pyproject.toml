@@ -1,0 +1,50 @@
+[project]
+name = "apple-caldav-mcp"
+version = "0.1.8"
+description = "Credential-free MCP for Apple iCloud Calendar, Reminders + Contacts (CalDAV + CardDAV), brokered through Tessera. Unofficial; not affiliated with Apple."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Dragos Hont" }]
+# The MCP holds NO Apple secret. It speaks CalDAV via `caldav` (RFC 4791 + RFC
+# 6764 discovery) but routes every request through Tessera's egress proxy, which
+# injects the Apple ID + app-specific password (HTTP Basic). `caldav` brings its
+# own HTTP layer (niquests). FastAPI + `mcp` serve the same tools as OpenAPI POST
+# routes and over the native Streamable HTTP MCP transport (mounted at /mcp), so
+# LibreChat / OpenWebUI / Claude consume them the standard way.
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.32",
+  "mcp>=1.20",
+  "caldav>=3.2,<4",
+  "icalendar>=5.0",
+  "defusedxml>=0.7",
+]
+
+[project.scripts]
+apple-caldav-mcp = "apple_mcp.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/apple_mcp"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.7",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
