@@ -1,10 +1,16 @@
 # apple-caldav-mcp
 
-A **credential-free** MCP server for **Apple iCloud Calendar, Reminders + Contacts** (CalDAV + CardDAV).
-It holds **no** Apple secret. Every iCloud request is brokered through
-[Tessera](https://github.com/dragoshont/tessera), which injects the
-Apple ID + app-specific password (HTTP Basic) and returns only the result — the
-credential never reaches this process.
+An MCP server for **Apple iCloud Calendar, Reminders + Contacts** (CalDAV + CardDAV).
+Its default brokered mode is credential-free and routes requests through
+[Tessera](https://github.com/dragoshont/tessera), which injects the Apple ID and
+app-specific password.
+
+It also supports an explicit **guarded direct mode** for installations whose
+Tessera deployment has retired the raw egress compatibility plane. Direct mode
+places the Apple app-specific password in this pod, injects Basic auth only after
+exact Apple-host/HTTPS/default-port validation, strips caller and Tessera identity
+headers, disables RFC 6764 bootstrap, and manually validates every redirect. This
+is a temporary custody exception; brokered mode remains the default.
 
 > Unofficial; not affiliated with Apple. Read-first — calendar writes are opt-in (off by default).
 
@@ -19,14 +25,13 @@ Four **read** tools plus one **opt-in write** tool, exposed over the native
 | `list_events` | `start?`, `end?` (ISO date/datetime; default today..+7d) | event metadata (summary, start, end, location, calendar, uid) |
 | `list_reminders` | `include_completed?` (default false) | reminder (VTODO) metadata (summary, due, status, completed, priority, calendar, uid) — never notes |
 | `find_contacts` | `query` (≥2 chars), `limit?` (default 10, max 25) | **search** of the address book (CardDAV): matched contacts' name, a few emails/phones, org — never photos, notes or postal addresses |
-| `create_event` | `summary`, `start`, `end`, `location?`, `calendar?` | writes a calendar event (returns `status="created"`); **only exposed when `APPLE_MCP_ENABLE_WRITES` is set** — see **Writes** below |
+| `create_event` | `summary`, `start`, `end`, `location?`, `calendar?` | brokered-mode calendar write; never exposed in guarded direct mode |
 
 ### Writes (opt-in, off by default)
 
-`create_event` is the only mutation, and it is **absent from the surface unless
-`APPLE_MCP_ENABLE_WRITES` is set** — so by default this is a read-only server and a
-prompt-injected model cannot reach a write at all. Even when enabled the write is
-authorized **server-side by Tessera, never here**: the `manage:dav` plane is denied
+`create_event` is the only mutation. It is available only in brokered mode when
+`APPLE_MCP_ENABLE_WRITES` is set; guarded direct mode suppresses it regardless of
+that flag. In brokered mode the write is authorized server-side by Tessera: the `manage:dav` plane is denied
 without a write grant for the `(caller, on-behalf-of)` pair, and if the grant maps the
 write to step-up, Tessera **holds it for the person's out-of-band approval** (ADR 0023) —
 returning `status="pending_approval"` until they approve in the Tessera portal, then
@@ -43,11 +48,11 @@ authorization decision.
 
 ## Use it
 
-**Prerequisite — a running [Tessera](https://github.com/dragoshont/tessera)** that, for this
+**Brokered-mode prerequisite — a running [Tessera](https://github.com/dragoshont/tessera)** that, for this
 target, has: an `apple-caldav` egress recipe, a grant `(caller, on-behalf-of) → read:dav`
 (add `manage:dav` to allow writes), and a binding `(apple-caldav, on-behalf-of) → <KV secret>`
 whose bundle is `{"access_token": "<app-specific password>", "extra": {"username": "<Apple ID>"}}`.
-This MCP holds none of that — it only forwards.
+In brokered mode this MCP holds none of that — it only forwards.
 
 **Run it** (the image is published to GHCR by CI):
 
@@ -60,6 +65,10 @@ docker run --rm -p 8080:8080 \
   ghcr.io/dragoshont/apple-caldav-mcp
 # append  -e APPLE_MCP_ENABLE_WRITES=1  to expose create_event
 ```
+
+For guarded direct mode, replace the Tessera variables with
+`APPLE_MCP_DIRECT=true`, `APPLE_ID`, and `APPLE_APP_PASSWORD` from a secret store.
+Direct mode is always read-only.
 
 **Wire it into an MCP client** (e.g. LibreChat `librechat.yaml`) at the **canonical
 `/mcp/` URL — keep the trailing slash** (a bare `/mcp` 307-redirects and destabilises the
@@ -74,14 +83,14 @@ mcpServers:
       Authorization: "Bearer {{LIBRECHAT_OPENID_ACCESS_TOKEN}}"
 ```
 
-Then ask in plain language — *"what's on my calendar this week?"* or (writes enabled)
+Then ask in plain language — *"what's on my calendar this week?"* or (brokered writes enabled)
 *"add 'Dentist' tomorrow 9–10"*. The model picks the tool; Tessera resolves **whose**
 calendar from the forwarded identity.
 
 ## How the brokering works
 
 ```
-LibreChat ──Bearer <user OIDC token>──▶ apple-caldav-mcp ──┐  (holds NO Apple secret)
+LibreChat ──Bearer <user OIDC token>──▶ apple-caldav-mcp ──┐  (brokered mode)
                                                      │  mints its OWN app-only
                                                      │  caller token; forwards
                                                      ▼  the user token
@@ -117,6 +126,9 @@ Per hop the transport attaches exactly three non-credential headers:
 | `TESSERA_CALLER_CLIENT_ID` | the MCP's caller client id (the grant's `caller`/`azp`) |
 | `TESSERA_CALLER_CLIENT_SECRET` | the caller client secret (from Key Vault via ESO) |
 | `TESSERA_CALLER_SCOPE` | OAuth scope (default `openid tessera_caller` → `idtyp=app`) |
+| `APPLE_MCP_DIRECT` | Set `true` to use guarded direct CalDAV instead of Tessera (default false) |
+| `APPLE_ID` | Apple Account identifier for direct mode only |
+| `APPLE_APP_PASSWORD` | Apple app-specific password for direct mode only; inject from a secret store |
 | `APPLE_MCP_HTTP_PORT` | listen port (default 8080) |
 | `APPLE_MCP_ENABLE_WRITES` | set to expose the `create_event` write tool (default off → read-only surface) |
 
@@ -136,8 +148,10 @@ pytest -q          # offline: no network, no Apple call, no secrets
 ruff check src tests
 ```
 
-The tests cover the security-relevant **request construction**: the egress URL +
-the three identity headers, the partition-redirect following + host validation,
-the redirect cap, and the caller-token mint/cache — all mockable, no live Apple
-call. The end-to-end "what's on my calendar?" proof is the operator-gated egress
-flip (real iCloud), not an offline test.
+Direct-mode rollback: unset `APPLE_MCP_DIRECT`, `APPLE_ID`, and
+`APPLE_APP_PASSWORD`, then restore a working Tessera egress URL/policy. Never
+commit either Apple credential, pass it in argv, or expose direct mode publicly.
+
+The tests cover brokered identity headers and direct-mode host/IP pinning, TLS
+hostname configuration, credential stripping, redirect semantics, and DAV response
+compatibility without a live Apple call. End-to-end proof is a bounded live read.

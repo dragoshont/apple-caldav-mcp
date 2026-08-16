@@ -8,10 +8,9 @@ COPY src ./src
 
 RUN pip install --no-cache-dir .
 
-# The MCP holds NO Apple secret. Its own caller client-credentials (client id +
-# secret) and the Tessera egress URL are injected at runtime via env (TESSERA_*),
-# never baked into the image. The Apple ID + app-specific password live ONLY in
-# Key Vault and are injected by Tessera at egress — they never reach this process.
+# Brokered mode receives only caller credentials. Guarded direct mode receives
+# the Apple ID + app-specific password from a runtime secret store. Neither mode
+# bakes credentials into the image or argv.
 EXPOSE 8080
 ENV APPLE_MCP_HTTP_PORT=8080 HOME=/tmp
 

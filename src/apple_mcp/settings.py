@@ -1,9 +1,4 @@
-"""Configuration for apple-mcp. Single place that reads env.
-
-The MCP has no Apple egress of its own — it forwards CalDAV through Tessera's
-egress proxy and authenticates with its OWN app-only caller token (Authentik
-client-credentials). It never reads or stores an Apple secret.
-"""
+"""Configuration for brokered and guarded direct Apple DAV modes."""
 from __future__ import annotations
 
 import os
@@ -30,6 +25,21 @@ def tessera_egress_url() -> str:
 def tessera_target() -> str:
     """The Tessera proxy target name (matches the recipe/binding/grant)."""
     return os.environ.get("TESSERA_TARGET", "apple-caldav")
+
+
+def direct_mode() -> bool:
+    """Use the temporary direct CalDAV transport instead of legacy Tessera egress."""
+    return env_flag("APPLE_MCP_DIRECT", default=False)
+
+
+def apple_id() -> str:
+    """Apple Account identifier used only by the guarded direct transport."""
+    return os.environ.get("APPLE_ID", "")
+
+
+def apple_app_password() -> str:
+    """Apple app-specific password used only by the guarded direct transport."""
+    return os.environ.get("APPLE_APP_PASSWORD", "")
 
 
 def authentik_token_url() -> str:
@@ -81,13 +91,12 @@ def http_port() -> int:
 
 
 def writes_enabled() -> bool:
-    """Whether calendar WRITE tools (``create_event``) are exposed. OFF by default —
-    writes stay INVISIBLE + inert until an operator deliberately sets
-    ``APPLE_MCP_ENABLE_WRITES`` AND a Tessera ``manage:dav`` grant exists. The grant is
-    the real authority gate (Tessera denies writes without it, then still requires an
-    out-of-band human approval, ADR 0023); this flag keeps the tool surface off so a
-    prompt-injected model cannot even attempt a write before that is deliberate."""
-    return env_flag("APPLE_MCP_ENABLE_WRITES", default=False)
+    """Expose brokered calendar writes only; direct mode is always read-only.
+
+    Brokered writes stay invisible until an operator sets
+    ``APPLE_MCP_ENABLE_WRITES`` and a Tessera ``manage:dav`` grant exists.
+    """
+    return not direct_mode() and env_flag("APPLE_MCP_ENABLE_WRITES", default=False)
 
 
 def debug() -> bool:

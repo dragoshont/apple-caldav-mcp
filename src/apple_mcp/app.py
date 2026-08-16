@@ -1,9 +1,8 @@
-"""FastAPI app: native Streamable HTTP MCP (/mcp) + OpenAPI tool routes + /healthz.
+"""FastAPI app: native Streamable HTTP MCP (/mcp) + OpenAPI tool routes.
 
-Credential-free: this process holds no Apple secret. It authenticates to Tessera
-with its OWN app-only caller token (client-credentials) and forwards the
-signed-in person's OIDC token (captured per request) as ``X-Tessera-On-Behalf-Of``;
-Tessera owns the Apple credential and returns only results.
+Brokered mode forwards identity to Tessera and holds no Apple credential. The
+explicit guarded direct mode receives an app-specific password from its runtime
+secret store and applies strict Apple host/IP mediation before each connection.
 
 A fresh :class:`AppleCalendarService` is built per tool call with the
 request-scoped on-behalf-of token, so one user's call can never reuse another
@@ -21,8 +20,11 @@ from .context import bearer_from_asgi_headers, get_obo_token, set_obo_token
 from .mcp_streamable import _tool_schema, build_session_manager
 from .service import AppleCalendarService
 from .settings import (
+    apple_app_password,
+    apple_id,
     authentik_token_url,
     diag,
+    direct_mode,
     http_port,
     max_redirects,
     request_timeout,
@@ -45,7 +47,7 @@ if not any(isinstance(h, logging.StreamHandler) for h in _applog.handlers):
     _applog.addHandler(_stream)
 
 
-# ── secret-free audit + scrub (the MCP holds no secret; defence in depth) ────
+# ── secret-free audit + credential scrub ────────────────────────────────────
 # Strips credential-shaped substrings before an error/log line can carry them.
 # Two families: prefix-keyed (Bearer / Basic / the on-behalf-of header) and
 # prefix-free forms a credential takes if it leaks into a body — a `client_secret`
@@ -63,7 +65,11 @@ _SECRET_RE = re.compile(
 
 def _scrub(text: str) -> str:
     """Strip credential-shaped substrings from an error before it can reach the model."""
-    return _SECRET_RE.sub("[redacted]", text or "")
+    scrubbed = _SECRET_RE.sub("[redacted]", text or "")
+    for value in (apple_id(), apple_app_password()):
+        if value:
+            scrubbed = scrubbed.replace(value, "[redacted]")
+    return scrubbed
 
 
 def _audit(name: str, params: dict, outcome: str) -> None:
@@ -106,6 +112,13 @@ def _get_caller() -> _CallerToken:
 
 def _build_service(obo_token: str) -> AppleCalendarService:
     """Build a per-call service bound to the request's on-behalf-of token."""
+    if direct_mode():
+        return AppleCalendarService(
+            direct_username=apple_id(),
+            direct_app_password=apple_app_password(),
+            timeout=request_timeout(),
+            max_redirects=max_redirects(),
+        )
     return AppleCalendarService(
         egress_url=tessera_egress_url(),
         target=tessera_target(),
@@ -139,7 +152,8 @@ from contextlib import asynccontextmanager  # noqa: E402
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    log.info("apple-mcp ready (credential-free; iCloud CalDAV via Tessera egress proxy)")
+    mode = "guarded direct CalDAV" if direct_mode() else "credential-free Tessera egress"
+    log.info("apple-mcp ready (%s)", mode)
     async with _session_manager.run():
         yield
 
@@ -148,21 +162,33 @@ app = FastAPI(
     title="apple-caldav-mcp",
     description=(
         "MCP for Apple iCloud Calendar, Reminders + Contacts (CalDAV + CardDAV). "
-        "Unofficial; not affiliated with Apple. Credential-free: holds no Apple "
-        "secret — every request is brokered through Tessera, which injects the "
-        "app-specific password. Reads (list_calendars, list_events, list_reminders, "
-        "find_contacts) plus an opt-in write (create_event) that requires an "
-        "out-of-band human approval. Tools are exposed both as OpenAPI POST "
+        "Unofficial; not affiliated with Apple. Supports credential-free Tessera "
+        "egress and an explicitly enabled guarded direct CalDAV mode. Reads "
+        "(list_calendars, list_events, list_reminders, "
+        "find_contacts). Brokered mode can expose create_event behind Tessera "
+        "approval; guarded direct mode is always read-only. Tools are exposed as OpenAPI POST "
         "routes and over native Streamable HTTP MCP at /mcp."
     ),
-    version="0.1.7",
+    version="0.1.9",
     lifespan=_lifespan,
 )
 
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"ok": True, "credential_free": True}
+    direct = direct_mode()
+    return {
+        "ok": True,
+        "credential_free": not direct,
+        "mode": "direct" if direct else "tessera",
+    }
+
+
+@app.get("/readyz")
+def readyz() -> dict:
+    if direct_mode() and (not apple_id() or not apple_app_password()):
+        raise HTTPException(status_code=503, detail="direct Apple credentials are not configured")
+    return healthz()
 
 
 def _register_openapi_route(name: str, fn) -> None:

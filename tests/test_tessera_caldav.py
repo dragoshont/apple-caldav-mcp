@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 
 import pytest
 
 from apple_mcp.tessera_caldav import (
     AppleEgressError,
+    DirectCalDAVClient,
     TesseraCalDAVClient,
     _CallerToken,
     is_allowed_apple_host,
@@ -179,12 +181,55 @@ def test_brokered_resolves_relative_redirect_location():
     assert final == "https://caldav.icloud.com/456/principal/"
 
 
+def test_brokered_303_switches_to_get_without_entity_headers():
+    sess = _RecordingSession([_FakeResp(303, {"Location": "/next"}), _FakeResp(200)])
+    client = _client(sess)
+    client._brokered(
+        "https://caldav.icloud.com/",
+        "POST",
+        "payload",
+        {
+            "Content-Type": "text/plain",
+            "Content-Length": "7",
+            "Content-Encoding": "gzip",
+            "Content-Language": "en",
+            "Content-Location": "/old",
+            "Digest": "sha-256=x",
+            "Last-Modified": "now",
+            "Depth": "1",
+        },
+    )
+    assert sess.calls[1]["method"] == "GET"
+    assert sess.calls[1]["data"] == b""
+    assert not any(
+        key.lower().startswith("content-") for key in sess.calls[1]["headers"]
+    )
+    assert "Digest" not in sess.calls[1]["headers"]
+    assert "Last-Modified" not in sess.calls[1]["headers"]
+    assert sess.calls[1]["headers"]["Depth"] == "1"
+
+
 def test_brokered_refuses_redirect_off_apple():
     sess = _RecordingSession([_FakeResp(302, {"Location": "https://evil.example.com/x"})])
     c = _client(sess)
     with pytest.raises(AppleEgressError):
         c._brokered("https://caldav.icloud.com/", "PROPFIND", "", {})
     assert len(sess.calls) == 1  # the off-allow-list redirect was NOT followed
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://p52-caldav.icloud.com/x",
+        "https://p52-caldav.icloud.com:8443/x",
+    ],
+)
+def test_brokered_refuses_redirect_with_unsafe_scheme_or_port(location):
+    sess = _RecordingSession([_FakeResp(302, {"Location": location})])
+    c = _client(sess)
+    with pytest.raises(AppleEgressError):
+        c._brokered("https://caldav.icloud.com/", "PROPFIND", "", {})
+    assert len(sess.calls) == 1
 
 
 def test_brokered_caps_redirects():
@@ -274,12 +319,212 @@ def test_brokered_validates_first_hop_not_just_redirects():
         "http://caldav.icloud.com/",          # non-https downgrade
         "https://evil.example.com/",          # non-Apple host
         "https://caldav.icloud.com:8443/",    # non-default port
+        "https://user:password@caldav.icloud.com/",  # URL userinfo
     ):
         sess = _RecordingSession([_FakeResp(207)])
         c = _client(sess)
         with pytest.raises(AppleEgressError):
             c._brokered(bad, "PROPFIND", "", {})
         assert sess.calls == []  # nothing was brokered upstream
+
+
+def test_direct_request_injects_basic_only_for_allowed_apple_host():
+    calls = []
+
+    class _Pool:
+        def urlopen(self, method, target, **kwargs):
+            calls.append({"method": method, "target": target, **kwargs})
+            return type("Response", (), {
+                "status": 207, "headers": {}, "data": b"", "reason": "Multi-Status"
+            })()
+
+        def close(self):
+            pass
+
+    client = DirectCalDAVClient(
+        username="owner@example.com",
+        app_password="app-password",
+        resolver=lambda host: ["17.0.0.1"],
+        pool_factory=lambda address, host, timeout: _Pool(),
+    )
+    client._tessera_request(
+        "https://caldav.icloud.com/123/calendars/",
+        "PROPFIND",
+        "<propfind/>",
+        {
+            "Depth": "1",
+            "Authorization": "Bearer untrusted",
+            "Cookie": "bad=1",
+            "X-Tessera-On-Behalf-Of": "user-token",
+            "X-Tessera-Write-Summary": "private broker metadata",
+        },
+    )
+    call = calls[0]
+    assert call["target"] == "/123/calendars/"
+    assert call["redirect"] is False
+    assert call["headers"]["Authorization"].startswith("Basic ")
+    assert "untrusted" not in call["headers"]["Authorization"]
+    assert "Cookie" not in call["headers"]
+    assert not any(key.lower().startswith("x-tessera-") for key in call["headers"])
+    assert call["headers"]["Depth"] == "1"
+
+
+def test_direct_request_refuses_non_apple_before_sending_credentials():
+    called = []
+    client = DirectCalDAVClient(
+        username="owner@example.com",
+        app_password="app-password",
+        resolver=lambda host: called.append(host) or ["17.0.0.1"],
+    )
+    with pytest.raises(AppleEgressError):
+        client._tessera_request("https://evil.example.com/", "GET", "", {})
+    assert called == []
+
+
+def test_direct_redirect_revalidates_before_sending_second_request():
+    calls = []
+
+    class _Pool:
+        def urlopen(self, method, target, **kwargs):
+            calls.append(target)
+            return type("Response", (), {
+                "status": 302,
+                "headers": {"Location": "https://evil.example.com/x"},
+                "data": b"",
+                "reason": "Found",
+            })()
+
+        def close(self):
+            pass
+
+    client = DirectCalDAVClient(
+        username="owner@example.com",
+        app_password="app-password",
+        resolver=lambda host: ["17.0.0.1"],
+        pool_factory=lambda address, host, timeout: _Pool(),
+    )
+    with pytest.raises(AppleEgressError):
+        client._brokered("https://caldav.icloud.com/", "PROPFIND", "", {})
+    assert len(calls) == 1
+
+
+def test_direct_resolution_rejects_non_global_or_mixed_answers(monkeypatch):
+    import apple_mcp.tessera_caldav as transport
+
+    for answers in (
+        [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))],
+        [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("17.0.0.1", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 443)),
+        ],
+    ):
+        monkeypatch.setattr(
+            transport.socket,
+            "getaddrinfo",
+            lambda *args, answers=answers, **kwargs: answers,
+        )
+        with pytest.raises(AppleEgressError, match="non-global"):
+            transport._resolve_global_addresses("caldav.icloud.com")
+
+
+def test_direct_resolution_prefers_ipv4_then_ipv6(monkeypatch):
+    import apple_mcp.tessera_caldav as transport
+
+    answers = [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700::1", 443, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("17.0.0.2", 443)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("17.0.0.1", 443)),
+    ]
+    monkeypatch.setattr(
+        transport.socket, "getaddrinfo", lambda *args, **kwargs: answers
+    )
+    assert transport._resolve_global_addresses("caldav.icloud.com") == [
+        "17.0.0.1",
+        "17.0.0.2",
+        "2606:4700::1",
+    ]
+
+
+def test_pinned_pool_uses_ip_with_apple_sni_and_hostname_assertion(monkeypatch):
+    import apple_mcp.tessera_caldav as transport
+
+    captured = {}
+
+    class _Pool:
+        pass
+
+    def pool(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _Pool()
+
+    monkeypatch.setattr(transport.urllib3, "HTTPSConnectionPool", pool)
+    assert isinstance(transport._pinned_pool("17.0.0.1", "caldav.icloud.com", 12), _Pool)
+    assert captured["args"] == ("17.0.0.1",)
+    assert captured["kwargs"]["port"] == 443
+    assert captured["kwargs"]["server_hostname"] == "caldav.icloud.com"
+    assert captured["kwargs"]["assert_hostname"] == "caldav.icloud.com"
+    assert captured["kwargs"]["cert_reqs"] == "CERT_REQUIRED"
+    assert captured["kwargs"]["retries"] is False
+
+
+def test_direct_response_wraps_into_real_dav_response():
+    xml = b'<?xml version="1.0"?><multistatus xmlns="DAV:"/>'
+
+    class _Pool:
+        def urlopen(self, *args, **kwargs):
+            return type("Response", (), {
+                "status": 207,
+                "headers": {"Content-Type": "application/xml"},
+                "data": xml,
+                "reason": "Multi-Status",
+            })()
+
+        def close(self):
+            pass
+
+    client = DirectCalDAVClient(
+        username="owner@example.com",
+        app_password="app-password",
+        resolver=lambda host: ["17.0.0.1"],
+        pool_factory=lambda address, host, timeout: _Pool(),
+    )
+    response = client.request("/", "PROPFIND", "", {"Depth": "0"})
+    assert response.status == 207
+    assert response.tree.tag.endswith("multistatus")
+
+
+def test_direct_resolver_errors_are_type_only():
+    client = DirectCalDAVClient(
+        username="owner@example.com",
+        app_password="app-password",
+        resolver=lambda host: (_ for _ in ()).throw(RuntimeError("app-password")),
+    )
+    with pytest.raises(AppleEgressError, match="RuntimeError") as error:
+        client._tessera_request("https://caldav.icloud.com/", "GET", "", {})
+    assert "app-password" not in str(error.value)
+
+
+def test_direct_credentials_are_scrubbed_from_errors(monkeypatch):
+    from apple_mcp.app import _safe_detail
+
+    monkeypatch.setenv("APPLE_ID", "owner@example.com")
+    monkeypatch.setenv("APPLE_APP_PASSWORD", "app-password")
+    detail = _safe_detail(AppleEgressError("owner@example.com failed with app-password"))
+    assert "owner@example.com" not in detail
+    assert "app-password" not in detail
+    assert detail.count("[redacted]") == 2
+
+
+def test_direct_mode_builds_service_without_tessera_caller(monkeypatch):
+    import apple_mcp.app as app_mod
+
+    monkeypatch.setenv("APPLE_MCP_DIRECT", "true")
+    monkeypatch.setenv("APPLE_ID", "owner@example.com")
+    monkeypatch.setenv("APPLE_APP_PASSWORD", "app-password")
+    monkeypatch.delenv("TESSERA_EGRESS_URL", raising=False)
+    service = app_mod._build_service("")
+    assert isinstance(service._client, DirectCalDAVClient)
 
 
 # ── MINOR-4 (1): the scrub strips a caller secret + an OBO token from errors ──

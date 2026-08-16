@@ -1,6 +1,9 @@
 """Smoke tests: the tool surface is read-only and the schemas are clean."""
 from __future__ import annotations
 
+import pytest
+from fastapi import HTTPException
+
 from apple_mcp.mcp_streamable import _render_result, _tool_schema
 from apple_mcp.tools import TOOLS
 
@@ -41,6 +44,21 @@ def test_healthz_reports_credential_free():
     body = healthz()
     assert body["ok"] is True
     assert body["credential_free"] is True
+
+
+def test_direct_readiness_requires_both_credentials(monkeypatch):
+    from apple_mcp.app import readyz
+
+    monkeypatch.setenv("APPLE_MCP_DIRECT", "true")
+    monkeypatch.delenv("APPLE_ID", raising=False)
+    monkeypatch.delenv("APPLE_APP_PASSWORD", raising=False)
+    with pytest.raises(HTTPException) as error:
+        readyz()
+    assert error.value.status_code == 503
+
+    monkeypatch.setenv("APPLE_ID", "owner@example.com")
+    monkeypatch.setenv("APPLE_APP_PASSWORD", "app-password")
+    assert readyz() == {"ok": True, "credential_free": False, "mode": "direct"}
 
 
 def test_render_events_is_readable_prose_not_json():
