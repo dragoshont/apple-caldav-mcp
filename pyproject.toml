@@ -1,21 +1,21 @@
 [project]
 name = "apple-caldav-mcp"
-version = "0.1.8"
-description = "Credential-free MCP for Apple iCloud Calendar, Reminders + Contacts (CalDAV + CardDAV), brokered through Tessera. Unofficial; not affiliated with Apple."
+version = "0.1.9"
+description = "MCP for Apple iCloud Calendar, Reminders + Contacts with guarded direct CalDAV or Tessera brokering. Unofficial; not affiliated with Apple."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Dragos Hont" }]
-# The MCP holds NO Apple secret. It speaks CalDAV via `caldav` (RFC 4791 + RFC
-# 6764 discovery) but routes every request through Tessera's egress proxy, which
-# injects the Apple ID + app-specific password (HTTP Basic). `caldav` brings its
+# The MCP speaks CalDAV via `caldav` (RFC 4791). Brokered mode routes through
+# Tessera; guarded direct mode injects a secret-store-provided app password only
+# after connect-time Apple host/IP validation. `caldav` brings its
 # own HTTP layer (niquests). FastAPI + `mcp` serve the same tools as OpenAPI POST
 # routes and over the native Streamable HTTP MCP transport (mounted at /mcp), so
 # LibreChat / OpenWebUI / Claude consume them the standard way.
 dependencies = [
   "fastapi>=0.115",
   "uvicorn>=0.32",
-  "mcp>=1.20",
+  "mcp==1.28.1",
   "caldav>=3.2,<4",
   "icalendar>=5.0",
   "defusedxml>=0.7",

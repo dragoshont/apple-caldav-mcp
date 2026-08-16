@@ -55,6 +55,19 @@ def test_writes_enabled_flag(monkeypatch):
     assert writes_enabled() is True
 
 
+def test_direct_mode_suppresses_write_tool(monkeypatch):
+    from apple_mcp import tools
+
+    monkeypatch.setenv("APPLE_MCP_DIRECT", "true")
+    monkeypatch.setenv("APPLE_MCP_ENABLE_WRITES", "true")
+    importlib.reload(tools)
+    assert "create_event" not in tools.TOOLS
+
+    monkeypatch.delenv("APPLE_MCP_DIRECT")
+    monkeypatch.delenv("APPLE_MCP_ENABLE_WRITES")
+    importlib.reload(tools)
+
+
 def test_create_event_tool_is_gated_by_the_flag(monkeypatch):
     from apple_mcp import tools
 

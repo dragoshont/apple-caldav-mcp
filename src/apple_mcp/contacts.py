@@ -1,10 +1,10 @@
 """Apple iCloud Contacts (CardDAV) — read-only SEARCH, least-disclosure.
 
 The ``caldav`` library models CalDAV only, so this drives raw CardDAV (RFC 6352)
-over the SAME Tessera-brokered transport used for Calendar/Reminders: a PROPFIND
+over the same controlled transport used for Calendar/Reminders: a PROPFIND
 discovery chain (current-user-principal -> addressbook-home-set -> address books)
 then an ``addressbook-query`` REPORT with an ``FN`` text-match filter. The MCP
-holds no Apple secret — Tessera injects it.
+uses the credential custody of the configured brokered or guarded direct mode.
 
 Privacy + context-size by design:
   * SEARCH only — there is deliberately no "list every contact" surface, so a

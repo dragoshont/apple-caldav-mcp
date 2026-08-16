@@ -2,7 +2,8 @@
 
 Read tools (``list_calendars``, ``list_events``, ``list_reminders``, ``find_contacts``)
 match the ``read:dav`` grant. The WRITE tool (``create_event``) is exposed ONLY when
-``APPLE_MCP_ENABLE_WRITES`` is set, and is doubly gated beyond that: Tessera's PDP denies
+brokered mode is active and ``APPLE_MCP_ENABLE_WRITES`` is set. Guarded direct mode
+always suppresses writes. In brokered mode, Tessera's PDP denies
 the ``manage:dav`` plane without a write grant, and Tessera policy MAY additionally hold a
 write for OUT-OF-BAND human approval in the Tessera portal (ADR 0023 / HL-18) — a prompt-
 injected model can neither enable the tool nor self-approve a mutation.
@@ -98,8 +99,7 @@ def create_event(
     )
 
 
-# The WRITE surface is exposed ONLY when explicitly enabled (default off), so the create
-# tool is invisible + unreachable until an operator opts in (Tessera still gates the actual
-# mutation via the manage:dav grant, and MAY hold it for out-of-band approval, ADR 0023).
+# The WRITE surface is brokered-mode-only and explicitly enabled (default off).
+# Guarded direct mode keeps it invisible regardless of the environment flag.
 if writes_enabled():
     TOOLS["create_event"] = create_event

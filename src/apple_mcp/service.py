@@ -1,10 +1,10 @@
-"""Apple iCloud Calendar service — read-only Phase 1.
+"""Apple iCloud Calendar service over a controlled DAV transport.
 
-Drives the ``caldav`` library over the Tessera-brokered transport to implement
+Drives the ``caldav`` library over brokered or guarded direct transport to implement
 the two read-only tools: list the user's calendars and list events in a date
 range. A fresh client is built per call with the request-scoped on-behalf-of
 token, so one user's call can never reuse another user's session. The MCP holds
-no Apple secret — Tessera injects it.
+credential custody according to the configured transport mode.
 
 Least-disclosure: events are returned as metadata (summary, start, end, location,
 calendar, uid), not raw VEVENT bodies, so a single call can't drain a calendar's
@@ -23,7 +23,7 @@ import icalendar
 
 from .contacts import find_contacts as _find_contacts
 from .settings import diag
-from .tessera_caldav import AppleEgressError, TesseraCalDAVClient, _CallerToken
+from .tessera_caldav import AppleEgressError, DirectCalDAVClient, TesseraCalDAVClient, _CallerToken
 
 log = logging.getLogger("apple_mcp.service")
 
@@ -180,26 +180,38 @@ def _interpret_write(resp: Any, *, uid: str, summary: str, calendar: str | None)
 
 
 class AppleCalendarService:
-    """Apple Calendar operations over the Tessera-brokered transport (reads + gated writes)."""
+    """Apple Calendar operations over brokered or guarded direct DAV."""
 
     def __init__(
         self,
         *,
-        egress_url: str,
-        target: str,
-        caller: _CallerToken,
-        on_behalf_of: str,
+        egress_url: str = "",
+        target: str = "apple-caldav",
+        caller: _CallerToken | None = None,
+        on_behalf_of: str = "",
         timeout: float = 30.0,
         max_redirects: int = 5,
+        direct_username: str = "",
+        direct_app_password: str = "",
     ):
-        self._client = TesseraCalDAVClient(
-            egress_url=egress_url,
-            target=target,
-            caller=caller,
-            on_behalf_of=on_behalf_of,
-            timeout=timeout,
-            max_redirects=max_redirects,
-        )
+        if direct_username or direct_app_password:
+            self._client = DirectCalDAVClient(
+                username=direct_username,
+                app_password=direct_app_password,
+                timeout=timeout,
+                max_redirects=max_redirects,
+            )
+        else:
+            if caller is None:
+                raise AppleEgressError("Tessera caller is not configured")
+            self._client = TesseraCalDAVClient(
+                egress_url=egress_url,
+                target=target,
+                caller=caller,
+                on_behalf_of=on_behalf_of,
+                timeout=timeout,
+                max_redirects=max_redirects,
+            )
 
     def _calendars(self) -> list[Any]:
         try:

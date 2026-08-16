@@ -1,12 +1,8 @@
-"""Tessera-brokered CalDAV transport — apple-mcp's ONLY egress path to iCloud.
+"""Tessera-brokered and guarded direct CalDAV transports.
 
-The MCP holds **no** Apple secret. Every CalDAV request the ``caldav`` library
-builds is rerouted to Tessera's raw egress proxy (``ANY /v1/egress/{target}``,
-ADR 0022): Tessera authenticates the caller + the forwarded end-user, injects the
-Apple ID + app-specific password as HTTP Basic, strips the caller's identity, and
-reverse-proxies the request to an allow-listed, IP-pinned iCloud host. The
-app-specific password never reaches this process; the user's token never reaches
-Apple.
+Brokered mode reroutes requests to Tessera, which owns the Apple credential.
+Guarded direct mode receives an app-specific password from the runtime secret
+store and connects only after strict host, port, DNS-address, and TLS checks.
 
 Per hop this transport attaches three headers and nothing credential-bearing:
 
@@ -28,8 +24,11 @@ partition pattern first (defense in depth with Tessera's own allow-list, HL-4).
 """
 from __future__ import annotations
 
+import base64
+import ipaddress
 import json
 import re
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -37,6 +36,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Any
 
+import urllib3
 from caldav.davclient import DAVClient, DAVResponse
 
 try:  # caldav's body normaliser; fall back to identity if the internal moves.
@@ -75,9 +75,9 @@ _DEFAULT_HTTPS_PORT = 443
 class AppleEgressError(Exception):
     """An Apple CalDAV operation could not be brokered.
 
-    Carries a secret-free detail. The app layer is credential-free (Tessera owns
-    the Apple password and the caller token is never placed in an error), but
-    callers still treat the message as model-facing and keep it terse.
+    Carries a model-facing, scrubbed detail. Transport code never includes a
+    credential value intentionally; the app additionally redacts runtime direct
+    credentials and token-shaped strings.
     """
 
 
@@ -106,6 +106,8 @@ def _require_brokerable_apple_url(upstream_url: str) -> None:
     parts = urllib.parse.urlsplit(upstream_url)
     if parts.scheme != "https":
         raise AppleEgressError(f"refusing non-https upstream scheme '{parts.scheme}'")
+    if parts.username is not None or parts.password is not None:
+        raise AppleEgressError("refusing upstream URL userinfo")
     if not is_allowed_apple_host(parts.hostname):
         raise AppleEgressError(f"refusing non-Apple upstream host '{parts.hostname}'")
     try:
@@ -114,6 +116,50 @@ def _require_brokerable_apple_url(upstream_url: str) -> None:
         raise AppleEgressError("refusing upstream with a malformed port") from None
     if port is not None and port != _DEFAULT_HTTPS_PORT:
         raise AppleEgressError(f"refusing non-default upstream port '{port}'")
+
+
+def _resolve_global_addresses(host: str) -> list[str]:
+    """Resolve once and fail if DNS returns any non-global address."""
+    try:
+        answers = socket.getaddrinfo(host, _DEFAULT_HTTPS_PORT, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise AppleEgressError("Apple host resolution failed") from exc
+    addresses = sorted(
+        {answer[4][0] for answer in answers},
+        key=lambda value: (ipaddress.ip_address(value).version != 4, value),
+    )
+    if not addresses:
+        raise AppleEgressError("Apple host resolved to no addresses")
+    if any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise AppleEgressError("Apple host resolved to a non-global address")
+    return addresses
+
+
+class _PinnedResponse:
+    """Requests-compatible view over one preloaded urllib3 response."""
+
+    def __init__(self, response: Any, url: str):
+        self.status_code = response.status
+        self.headers = response.headers
+        self.content = response.data or b""
+        self.text = self.content.decode("utf-8", "replace")
+        self.reason = response.reason
+        self.url = url
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+def _pinned_pool(address: str, hostname: str, timeout: float):
+    return urllib3.HTTPSConnectionPool(
+        address,
+        port=_DEFAULT_HTTPS_PORT,
+        timeout=timeout,
+        retries=False,
+        cert_reqs="CERT_REQUIRED",
+        assert_hostname=hostname,
+        server_hostname=hostname,
+    )
 
 
 class _CallerToken:
@@ -250,19 +296,29 @@ class TesseraCalDAVClient(DAVClient):
         # Validate the FIRST hop (https + Apple host + default port) before we
         # broker it. Redirect targets are validated inside the loop, as before.
         _require_brokerable_apple_url(upstream_url)
+        current_method = method
+        current_body = body
+        current_headers = dict(headers)
         for _ in range(self._max_redirects + 1):
-            resp = self._tessera_request(upstream_url, method, body, headers)
+            resp = self._tessera_request(
+                upstream_url, current_method, current_body, current_headers
+            )
             if resp.status_code in _REDIRECT_CODES:
                 location = resp.headers.get("Location")
                 if not location:
                     return resp, upstream_url
                 target = urllib.parse.urljoin(upstream_url, location)
-                host = urllib.parse.urlsplit(target).hostname
-                if not is_allowed_apple_host(host):
-                    raise AppleEgressError(
-                        f"refusing redirect to non-Apple host '{host}' (RFC 6764 discovery)"
-                    )
+                _require_brokerable_apple_url(target)
                 upstream_url = target
+                if resp.status_code == 303:
+                    current_method = "GET"
+                    current_body = b""
+                    current_headers = {
+                        key: value
+                        for key, value in current_headers.items()
+                        if not key.lower().startswith("content-")
+                        and key.lower() not in {"digest", "last-modified"}
+                    }
                 continue
             return resp, upstream_url
         raise AppleEgressError("too many CalDAV partition redirects")
@@ -312,3 +368,74 @@ class TesseraCalDAVClient(DAVClient):
         except Exception:  # pragma: no cover - some HTTP libs make .url read-only
             pass
         return DAVResponse(resp, self)
+
+
+class DirectCalDAVClient(TesseraCalDAVClient):
+    """Temporary direct iCloud transport with the same guarded redirect path.
+
+    The app-specific password is injected only after the absolute destination
+    passes the exact Apple host, HTTPS, and default-port checks. Caller-provided
+    authorization and cookies are always discarded.
+    """
+
+    def __init__(
+        self,
+        *,
+        username: str,
+        app_password: str,
+        timeout: float = 30.0,
+        max_redirects: int = 5,
+        headers: Mapping[str, str] | None = None,
+        resolver: Callable[[str], list[str]] = _resolve_global_addresses,
+        pool_factory: Callable[[str, str, float], Any] = _pinned_pool,
+    ):
+        if not username or not app_password:
+            raise AppleEgressError("direct Apple credentials are not configured")
+        DAVClient.__init__(
+            self,
+            url=ICLOUD_CALDAV_ROOT,
+            headers=dict(headers or {}),
+            timeout=timeout,
+            enable_rfc6764=False,
+        )
+        self._basic = base64.b64encode(f"{username}:{app_password}".encode()).decode()
+        self._max_redirects = max(0, int(max_redirects))
+        self._resolver = resolver
+        self._pool_factory = pool_factory
+
+    def _tessera_request(
+        self, upstream_url: str, method: str, body: Any, headers: Mapping[str, str]
+    ):
+        _require_brokerable_apple_url(upstream_url)
+        out = {
+            key: value
+            for key, value in dict(headers or {}).items()
+            if key.lower() not in {"authorization", "cookie", "host"}
+            and not key.lower().startswith("x-tessera-")
+        }
+        out["Authorization"] = f"Basic {self._basic}"
+        pool = None
+        try:
+            parts = urllib.parse.urlsplit(upstream_url)
+            hostname = parts.hostname or ""
+            address = self._resolver(hostname)[0]
+            target = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+            out["Host"] = hostname
+            pool = self._pool_factory(address, hostname, self.timeout)
+            response = pool.urlopen(
+                method,
+                target,
+                body=to_wire(body),
+                headers=out,
+                redirect=False,
+                preload_content=True,
+                retries=False,
+            )
+            return _PinnedResponse(response, upstream_url)
+        except AppleEgressError:
+            raise
+        except Exception as exc:
+            raise AppleEgressError(f"direct Apple request failed: {type(exc).__name__}") from None
+        finally:
+            if pool is not None:
+                pool.close()
